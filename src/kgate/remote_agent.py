@@ -186,6 +186,27 @@ def read_ws_frame(sock: socket.socket) -> tuple[int, bytes]:
     return opcode, data
 
 
+def _read_pty(fd: int) -> bytes | None:
+    """Read everything already waiting on the PTY, as one chunk.
+
+    Returns None when the PTY has closed. One chunk becomes one websocket
+    frame, so a prompt is not split into several tunnel round trips.
+    """
+    chunks: list[bytes] = []
+    while len(b"".join(chunks)) < 262144:
+        try:
+            piece = os.read(fd, 65536)
+        except OSError:
+            return None if not chunks else b"".join(chunks)
+        if not piece:
+            return None if not chunks else b"".join(chunks)
+        chunks.append(piece)
+        ready, _, _ = select.select([fd], [], [], 0)
+        if not ready:
+            break
+    return b"".join(chunks)
+
+
 def token_ok(header_value: str | None, token: str) -> bool:
     if not header_value or not token:
         return False
@@ -494,9 +515,14 @@ class GateHandler(BaseHTTPRequestHandler):
             pass
         shell = self.gate.shell
         master = shell.ensure()
+        last_ping = time.monotonic()
         try:
             while True:
-                readable, _, _ = select.select([sock, master], [], [], 0.5)
+                readable, _, _ = select.select([sock, master], [], [], 1.0)
+                now = time.monotonic()
+                if now - last_ping >= 15:
+                    sock.sendall(encode_ws_frame(b"k", opcode=0x9, mask=False))
+                    last_ping = now
                 if sock in readable:
                     opcode, data = read_ws_frame(sock)
                     if opcode == 0x8:
@@ -504,19 +530,19 @@ class GateHandler(BaseHTTPRequestHandler):
                     if opcode == 0x9:
                         sock.sendall(encode_ws_frame(data, opcode=0xA, mask=False))
                         continue
+                    if opcode == 0xA:
+                        continue
                     if opcode == 0x1:
                         self._control_text(data, shell)
                         continue
                     if opcode == 0x2 and data:
                         os.write(master, data)
                 if master in readable:
-                    try:
-                        data = os.read(master, 8192)
-                    except OSError:
+                    data = _read_pty(master)
+                    if data is None:
                         break
-                    if not data:
-                        break
-                    sock.sendall(encode_ws_frame(data, opcode=0x2, mask=False))
+                    if data:
+                        sock.sendall(encode_ws_frame(data, opcode=0x2, mask=False))
         except (EOFError, OSError, ValueError):
             pass
         finally:
@@ -575,7 +601,15 @@ def start_tunnel(local_port: int) -> tuple[subprocess.Popen[Any], str]:
     binary = install_cloudflared()
     proc = _track(
         subprocess.Popen(
-            [binary, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{local_port}"],
+            [
+                binary,
+                "tunnel",
+                "--no-autoupdate",
+                "--protocol",
+                "http2",
+                "--url",
+                f"http://127.0.0.1:{local_port}",
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

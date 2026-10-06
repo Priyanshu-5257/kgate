@@ -319,6 +319,20 @@ class StreamReadTests(unittest.TestCase):
         self.assertIn("KGATE_BOOT", text)
 
 
+class PendingTests(unittest.TestCase):
+    def test_plain_socket_has_no_tls_buffer(self) -> None:
+        from kgate.term import tls_pending
+
+        left, right = socket.socketpair()
+        try:
+            self.assertEqual(tls_pending(left), 0)
+            left.sendall(b"x")
+            self.assertEqual(tls_pending(right), 0)
+        finally:
+            left.close()
+            right.close()
+
+
 class FrameTests(unittest.TestCase):
     def test_masked_roundtrip(self) -> None:
         left, right = socket.socketpair()
