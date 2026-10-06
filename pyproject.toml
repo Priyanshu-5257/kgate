@@ -1,0 +1,13 @@
+[project]
+name = "kgate"
+version = "0.1.0"
+description = "Run a shell and an inference server on your Kaggle GPUs, and use them from this laptop."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+kgate = "kgate.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
