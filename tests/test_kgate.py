@@ -12,7 +12,13 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from kgate.launch import kernel_metadata, render_session_source
+from kgate.launch import (
+    build_config,
+    kernel_metadata,
+    render_session_source,
+    require_model,
+    status_blocks_new_launch,
+)
 from kgate.proxy import ProxyServer
 from kgate.remote_agent import (
     GateServer,
@@ -21,6 +27,7 @@ from kgate.remote_agent import (
     engine_argv,
     read_ws_frame,
     token_ok,
+    unsloth_install_command,
 )
 from kgate.store import Store
 from kgate.term import open_terminal
@@ -124,6 +131,44 @@ class BuildTests(unittest.TestCase):
         self.assertIn("--tensor-parallel-size", argv)
         self.assertIn("2", argv)
         self.assertIn("--enforce-eager", argv)
+
+    def test_unsloth_command_is_loopback_and_headless(self) -> None:
+        argv = engine_argv(
+            {"engine": "unsloth", "studio_port": 8888, "engine_args": []},
+            1,
+        )
+        self.assertEqual(argv[0:3], ["unsloth", "studio", "--host"])
+        self.assertIn("127.0.0.1", argv)
+        self.assertNotIn("0.0.0.0", argv)
+        self.assertNotIn("--secure", argv)
+        self.assertIn("--disable-tools", argv)
+        command = unsloth_install_command("/kaggle/working/unsloth-studio", "/kaggle/working/uv-cache")
+        self.assertIn("UNSLOTH_SKIP_AUTOSTART=1", command)
+        self.assertIn("https://unsloth.ai/install.sh", command)
+        self.assertNotIn("git clone", command)
+        self.assertNotIn("--local", command)
+        cfg = build_config(
+            run_id="abc",
+            token="t",
+            engine="unsloth",
+            model="",
+            accelerator="NvidiaTeslaT4",
+            hours=1,
+            engine_args=[],
+            max_model_len=4096,
+            tensor_parallel=1,
+            gpu_memory_utilization=0.9,
+            quantization="",
+            hf_token="",
+            dtype="",
+            studio_password="session-secret",
+        )
+        self.assertEqual(cfg["studio_port"], 8888)
+        self.assertEqual(cfg["engine_timeout_s"], 5400)
+        self.assertEqual(cfg["studio_password"], "session-secret")
+        require_model("unsloth", "")
+        with self.assertRaises(ValueError):
+            require_model("vllm", "")
 
     def test_token_compare(self) -> None:
         self.assertTrue(token_ok("Bearer secret", "secret"))
@@ -345,6 +390,52 @@ class FrameTests(unittest.TestCase):
         finally:
             left.close()
             right.close()
+
+
+class StaleKernelTests(unittest.TestCase):
+    def test_a_finished_run_does_not_block_the_next_launch(self) -> None:
+        self.assertFalse(status_blocks_new_launch("RUNNING", True))
+        self.assertTrue(status_blocks_new_launch("RUNNING", False))
+        self.assertTrue(status_blocks_new_launch("QUEUED", True))
+        self.assertFalse(status_blocks_new_launch("COMPLETE", False))
+
+    def test_down_clears_a_stopped_row_when_kaggle_status_is_stale(self) -> None:
+        import argparse
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+
+        from kgate.cli import cmd_down
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp))
+            token_path = store.write_token("main", "KGAT_test_token")
+            store.put_account(
+                {"name": "main", "username": "aivenger1st", "token_file": str(token_path), "created_at": "t"}
+            )
+            store.upsert_session(
+                {
+                    "id": "s1",
+                    "account": "main",
+                    "kernel": "aivenger1st/kgate-session",
+                    "status": "stopped",
+                    "started_at": "t",
+                    "proxy_pid": 0,
+                }
+            )
+            args = argparse.Namespace(session=None, account=None)
+            with (
+                patch("kgate.cli._store", return_value=store),
+                patch("kgate.launch.kaggle_cli.kernel_status", return_value=("RUNNING", "")),
+                patch("kgate.launch.kaggle_cli.kernel_run_finished", return_value=True),
+            ):
+                buffer = io.StringIO()
+                with redirect_stdout(buffer):
+                    code = cmd_down(args)
+            self.assertEqual(code, 0)
+            self.assertIn("log has ended", buffer.getvalue())
+            self.assertEqual(store.get_session("s1")["status"], "stopped")
 
 
 if __name__ == "__main__":

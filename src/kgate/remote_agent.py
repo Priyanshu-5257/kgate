@@ -13,6 +13,7 @@ import json
 import os
 import pty
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -72,9 +73,27 @@ def cloudflared_url_from_text(text: str) -> str | None:
 
 def engine_argv(cfg: dict[str, Any], gpus: int) -> list[str]:
     engine = cfg["engine"]
+    extra = list(cfg.get("engine_args") or [])
+    if engine == "unsloth":
+        # Kaggle is treated as Colab, and Unsloth refuses --secure there: the server
+        # comes up, then exits when its own tunnel is blocked. Bind loopback and let
+        # kgate's cloudflared publish the page.
+        argv = [
+            "unsloth",
+            "studio",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(cfg.get("studio_port") or 8888),
+            "--disable-tools",
+        ]
+        return argv + extra
+    if engine == "none":
+        return []
+    if engine == "ollama":
+        return ["ollama", "serve"]
     port = str(cfg["engine_port"])
     model = cfg["model"]
-    extra = list(cfg.get("engine_args") or [])
     raw_tp = cfg.get("tensor_parallel")
     tp = 1 if raw_tp is None else int(raw_tp)
     if tp <= 0:
@@ -124,10 +143,6 @@ def engine_argv(cfg: dict[str, Any], gpus: int) -> list[str]:
         if tp > 1:
             argv.extend(["--tp", str(tp)])
         return argv + extra
-    if engine == "ollama":
-        return ["ollama", "serve"]
-    if engine == "none":
-        return []
     raise ValueError(f"unknown engine {engine}")
 
 
@@ -647,6 +662,106 @@ def pip_install(packages: list[str]) -> None:
         raise RuntimeError(f"pip install failed with exit {completed.returncode}")
 
 
+def unsloth_dirs() -> tuple[str, str, str]:
+    """Install, Hugging Face cache, and uv cache. Kaggle's home disk is small."""
+    root = "/kaggle/working" if os.path.isdir("/kaggle/working") else tempfile_dir()
+    return (
+        os.path.join(root, "unsloth-studio"),
+        os.path.join(root, "huggingface"),
+        os.path.join(root, "uv-cache"),
+    )
+
+
+def unsloth_install_command(home: str, uv_cache: str) -> str:
+    """Release installer, not a git checkout. UNSLOTH_SKIP_AUTOSTART skips the Y/n prompt."""
+    return (
+        "curl -fsSL https://unsloth.ai/install.sh | "
+        "UNSLOTH_SKIP_AUTOSTART=1 "
+        f"UNSLOTH_STUDIO_HOME={shlex.quote(home)} "
+        f"UV_CACHE_DIR={shlex.quote(uv_cache)} "
+        "sh"
+    )
+
+
+def install_unsloth(home: str, uv_cache: str) -> str:
+    binary = os.path.join(home, "unsloth_studio", "bin", "unsloth")
+    if os.path.isfile(binary) and os.access(binary, os.X_OK):
+        log(f"using {binary}")
+        return binary
+    os.makedirs(home, exist_ok=True)
+    os.makedirs(uv_cache, exist_ok=True)
+    log("installing Unsloth Studio")
+    completed = subprocess.run(["bash", "-lc", unsloth_install_command(home, uv_cache)], check=False)
+    if completed.returncode != 0 or not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
+        raise RuntimeError("Unsloth Studio install failed. `kgate logs` has the installer output.")
+    return binary
+
+
+def _mirror_stdout(proc: subprocess.Popen[str], log_handle: Any, lines: list[str]) -> None:
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        lines.append(line)
+        try:
+            log_handle.write(line.encode())
+        except OSError:
+            pass
+        print(line, end="", flush=True)
+
+
+def start_unsloth(cfg: dict[str, Any], state: dict[str, Any], env: dict[str, str], log_handle: Any) -> None:
+    home, hf_home, uv_cache = unsloth_dirs()
+    binary = install_unsloth(home, uv_cache)
+    port = int(cfg.get("studio_port") or 8888)
+    child_env = env.copy()
+    child_env["UNSLOTH_STUDIO_HOME"] = home
+    child_env["HF_HOME"] = hf_home
+    child_env["HF_HUB_CACHE"] = os.path.join(hf_home, "hub")
+    child_env["UV_CACHE_DIR"] = uv_cache
+    password = str(cfg.get("studio_password") or "")
+    if password:
+        child_env["UNSLOTH_STUDIO_PASSWORD"] = password
+    argv = [binary, *engine_argv(cfg, gpu_count())[1:]]
+    log("starting " + " ".join(argv))
+    root = os.path.dirname(home)
+    proc = _track(
+        subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=child_env,
+            cwd=root if os.path.isdir(root) else None,
+            text=True,
+            start_new_session=True,
+        )
+    )
+    lines: list[str] = []
+    threading.Thread(target=_mirror_stdout, args=(proc, log_handle, lines), daemon=True).start()
+    deadline = time.time() + float(cfg.get("engine_timeout_s") or 5400)
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"Unsloth Studio exited {proc.returncode}")
+        if wait_http(port, "/", 4):
+            break
+    else:
+        raise RuntimeError("Unsloth Studio did not open its port. `kgate logs` has its output.")
+    log("opening a browser tunnel to Unsloth Studio")
+    _ui_proc, url = start_tunnel(port)
+    if proc.poll() is not None:
+        raise RuntimeError(f"Unsloth Studio exited {proc.returncode}")
+    state["engine_ready"] = True
+    state["ui_url"] = url
+    emit(
+        "ENGINE",
+        {
+            "run": cfg["run_id"],
+            "ready": True,
+            "engine": "unsloth",
+            "model": cfg.get("model") or "",
+            "ui_url": url,
+        },
+    )
+
+
 def install_ollama() -> None:
     if shutil.which("ollama"):
         return
@@ -699,6 +814,18 @@ def start_engine(cfg: dict[str, Any], state: dict[str, Any]) -> subprocess.Popen
     gpus = gpu_count()
     log(f"visible GPUs: {gpus}")
     env = os.environ.copy()
+    if engine == "unsloth":
+        def _run_unsloth() -> None:
+            try:
+                start_unsloth(cfg, state, env, log_handle)
+            except Exception as exc:  # noqa: BLE001 — reported to the laptop, session stays up
+                state["engine_ready"] = False
+                state["engine_error"] = str(exc)
+                emit("ENGINE", {"run": cfg["run_id"], "ready": False, "error": str(exc)})
+                log(str(exc))
+
+        threading.Thread(target=_run_unsloth, daemon=True).start()
+        return None
     if engine == "ollama":
         install_ollama()
         env["OLLAMA_HOST"] = f"127.0.0.1:{cfg['engine_port']}"

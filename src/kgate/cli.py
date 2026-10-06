@@ -14,14 +14,14 @@ from typing import Any
 from kgate import kaggle_cli
 from kgate.control import ControlError, exec_command
 from kgate.dashboard import ensure_dashboard, serve_dashboard
-from kgate.launch import adopt_logs, describe, launch_session, refresh_session, stop_remote
+from kgate.launch import adopt_logs, describe, launch_session, refresh_session, release_kernel
 from kgate.proxy import pick_port
 from kgate.store import Store
 from kgate.term import TermError, attach
 
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
-ENGINES = ("none", "vllm", "ollama", "sglang")
+ENGINES = ("none", "unsloth", "vllm", "ollama", "sglang")
 
 
 def _store() -> Store:
@@ -81,6 +81,10 @@ def _selected_session(store: Store, session_id: str | None, account: str | None)
 def _print_session(session: dict[str, Any]) -> None:
     shown = describe(session)
     print(f"session {shown['id']}  {shown.get('status')}  {shown.get('kernel_url')}")
+    if shown.get("ui_url"):
+        print(f"studio {shown['ui_url']}")
+    if shown.get("studio_password"):
+        print(f"studio password {shown['studio_password']}")
     if shown.get("base_url"):
         print(f"base URL {shown['base_url']}")
     if shown.get("model"):
@@ -222,15 +226,39 @@ def cmd_up(args: argparse.Namespace) -> int:
     return 0
 
 
+def _down_session(store: Store, session_id: str | None, account: str | None) -> dict[str, Any] | None:
+    """The session to stop. A row already marked stopped still counts.
+
+    `kgate down` used to ignore those rows, so a kernel Kaggle still called
+    RUNNING could not be stopped from the laptop.
+    """
+    try:
+        return _selected_session(store, session_id, account)
+    except KeyError as exc:
+        if session_id or exc.args[0] != "no running session":
+            raise
+    rows = store.list_sessions()
+    if account:
+        rows = [row for row in rows if row.get("account") == account]
+    if not rows:
+        return None
+    return rows[-1]
+
+
 def cmd_down(args: argparse.Namespace) -> int:
     store = _store()
     try:
-        session = _selected_session(store, args.session, args.account)
+        session = _down_session(store, args.session, args.account)
     except KeyError as exc:
-        return _die(str(exc))
+        return _die(str(exc.args[0]) if exc.args else "no running session")
     try:
-        account = store.get_account(str(session["account"]))
-        note = stop_remote(store, session, store.read_token(account))
+        if session is None:
+            account = store.resolve_account(args.account)
+            kernel = f"{account.get('username')}/{store.config()['kernel_slug']}"
+        else:
+            account = store.get_account(str(session["account"]))
+            kernel = str(session["kernel"])
+        note = release_kernel(store, store.read_token(account), kernel, session)
     except (KeyError, kaggle_cli.KaggleError, OSError) as exc:
         return _die(str(exc))
     print(note)
@@ -251,7 +279,7 @@ def cmd_ps(args: argparse.Namespace) -> int:
         model = shown.get("model") or "-"
         print(
             f"{shown['id']:24} {shown.get('status', ''):10} {shown.get('account', ''):12} "
-            f"{shown.get('engine', ''):8} {model:32} {shown.get('base_url', '')}"
+            f"{shown.get('engine', ''):8} {model:32} {shown.get('ui_url') or shown.get('base_url', '')}"
         )
     return 0
 
@@ -403,8 +431,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     up = sub.add_parser("up", help="start a private GPU session and forward it to localhost")
     up.add_argument("--account")
-    up.add_argument("--model", help="model id, for example Qwen/Qwen2.5-1.5B-Instruct or qwen2.5:7b")
-    up.add_argument("--engine", choices=ENGINES, help="default is vllm when --model is set, otherwise a shell")
+    up.add_argument("--model", help="model id, for example Qwen/Qwen2.5-1.5B-Instruct or qwen2.5:7b. Not used by --engine unsloth")
+    up.add_argument(
+        "--engine",
+        choices=ENGINES,
+        help="unsloth opens the Studio UI. vllm, ollama, and sglang serve an OpenAI API. Default is vllm when --model is set, otherwise a shell",
+    )
     up.add_argument("--accelerator", help="Kaggle machine shape, default NvidiaTeslaT4")
     up.add_argument("--hours", type=float, default=6, help="cap the session, also capped by remaining GPU quota")
     up.add_argument("--port", type=int, help="local port for the OpenAI API, default 8000")

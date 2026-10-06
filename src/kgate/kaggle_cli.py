@@ -152,6 +152,27 @@ def _stop_process(proc: subprocess.Popen[bytes]) -> None:
         proc.wait(timeout=2)
 
 
+def kernel_run_finished(token: str, kernel: str, idle_s: float = 2.0, max_s: float = 25.0) -> bool:
+    """True when the latest run has already exited.
+
+    Kaggle can keep reporting RUNNING after the script has finished and
+    exported its log. A live worker holds the log stream open. A finished
+    one replays the log and then closes it. The log text is discarded here
+    because it can contain the session secret.
+    """
+    proc = _logs_process(token, kernel)
+    try:
+        assert proc.stdout is not None
+        collect_stream(proc.stdout, idle_s, max_s)
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        return proc.poll() is not None and proc.returncode == 0
+    finally:
+        _stop_process(proc)
+
+
 def kernel_logs(token: str, kernel: str, idle_s: float = 1.2, max_s: float = 20) -> str:
     """Return the live notebook log. Empty only if the stream itself is empty."""
     proc = _logs_process(token, kernel)

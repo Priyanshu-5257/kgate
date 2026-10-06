@@ -87,6 +87,7 @@ PAGE = """<!DOCTYPE html>
   .row { display: flex; gap: 8px; }
   .row input { flex: 1; }
   .err { color: var(--oxide); }
+  a { color: var(--oxide); }
   @media (max-width: 800px) {
     .grid { grid-template-columns: 1fr; }
     h1 { font-size: 34px; }
@@ -212,13 +213,13 @@ function sessionTable(rows) {
     tr.append(who);
     const engine = el("td");
     engine.append(el("div", row.engine || "none"));
-    engine.append(el("div", row.model || "shell only", "num"));
+    engine.append(el("div", row.model || (row.engine === "unsloth" ? "pick a model in Studio" : "shell only"), "num"));
     tr.append(engine);
     const status = el("td");
     status.append(el("span", row.status || "unknown", "tag " + (row.status || "")));
     if (row.engine_error) status.append(el("div", row.engine_error, "err"));
     tr.append(status);
-    tr.append(el("td", row.base_url || "—", "num"));
+    tr.append(el("td", row.ui_url || row.base_url || "—", "num"));
     const actions = el("td");
     if (row.status === "ready" || row.status === "starting") {
       const stop = el("button", "Stop");
@@ -233,12 +234,34 @@ function sessionTable(rows) {
 }
 function localCard(payload) {
   localEl.replaceChildren();
-  const live = (payload.sessions || []).filter((row) => row.base_url && (row.status === "ready" || row.status === "starting"));
+  const live = (payload.sessions || []).filter((row) => (row.status === "ready" || row.status === "starting") && (row.ui_url || row.base_url || row.engine === "unsloth"));
   if (!live.length) {
     localEl.append(el("p", "Nothing is forwarded to this laptop right now."));
     return;
   }
   const row = live[live.length - 1];
+  if (row.engine === "unsloth") {
+    localEl.append(el("div", row.ui_url || "Installing Unsloth Studio…", "url"));
+    localEl.append(el("p", row.ui_url
+      ? "Unsloth Studio. Sign in with the password below, then search Hugging Face and load a model."
+      : "Unsloth Studio is installing on the notebook. This link appears when the installer finishes."));
+    if (row.studio_password) {
+      localEl.append(el("div", row.studio_password, "num"));
+      localEl.append(el("p", "Password for this session.", "lede"));
+    }
+    if (row.ui_url) {
+      const open = el("a", "Open Unsloth Studio");
+      open.href = row.ui_url;
+      open.target = "_blank";
+      localEl.append(open);
+    }
+    if (row.kernel_url) {
+      const page = el("a", row.kernel_url);
+      page.href = row.kernel_url;
+      localEl.append(page);
+    }
+    return;
+  }
   localEl.append(el("div", row.base_url, "url"));
   localEl.append(el("p", "OpenAI base URL. Use any API key. Model: " + (row.model || "(none until you start one in the shell)")));
   if (row.kernel_url) {
@@ -302,8 +325,9 @@ async function loadLogs() {
   meta.textContent = payload.meta || "No notebook log yet.";
   pre.textContent = payload.text || payload.error || "(no output yet)";
   if (stick) pre.scrollTop = pre.scrollHeight;
-  if ((payload.base_url || "") !== seenBase) {
-    seenBase = payload.base_url || "";
+  const stamp = (payload.ui_url || "") + "|" + (payload.base_url || "");
+  if (stamp !== seenBase) {
+    seenBase = stamp;
     load(false);
   }
 }
@@ -444,8 +468,10 @@ class Dashboard:
             "text": tail,
             "status": shown.get("status") or "",
             "base_url": shown.get("base_url") or "",
+            "ui_url": shown.get("ui_url") or "",
             "meta": (
                 f"{shown.get('kernel', '')} · {shown.get('status', '')}"
+                + (f" · {shown['ui_url']}" if shown.get("ui_url") else "")
                 + (f" · {shown['base_url']}" if shown.get("base_url") else "")
                 + " · live stream"
             ),

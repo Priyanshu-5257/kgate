@@ -63,6 +63,7 @@ def build_config(
     quantization: str,
     hf_token: str,
     dtype: str,
+    studio_password: str = "",
 ) -> dict[str, Any]:
     return {
         "run_id": run_id,
@@ -71,6 +72,8 @@ def build_config(
         "model": model,
         "engine_port": 8000,
         "gate_port": 8788,
+        "studio_port": 8888,
+        "studio_password": studio_password,
         "dtype": dtype or default_dtype(accelerator),
         "max_model_len": max_model_len,
         "tensor_parallel": tensor_parallel,
@@ -80,7 +83,7 @@ def build_config(
         "hf_token": hf_token,
         "trust_remote_code": True,
         "die_after_s": int(hours * 3600),
-        "engine_timeout_s": 2400,
+        "engine_timeout_s": 5400 if engine == "unsloth" else 2400,
     }
 
 
@@ -283,6 +286,52 @@ def stop_remote(store: Store, session: dict[str, Any], token: str) -> str:
     return note
 
 
+def status_blocks_new_launch(status: str, run_finished: bool) -> bool:
+    """A QUEUED kernel is still starting. RUNNING blocks only while its log is live.
+
+    After the notebook exits, Kaggle often leaves the status at RUNNING. That
+    stale status must not refuse the next launch.
+    """
+    if status == "QUEUED":
+        return True
+    if status != "RUNNING":
+        return False
+    return not run_finished
+
+
+def release_kernel(
+    store: Store,
+    token: str,
+    kernel: str,
+    session: dict[str, Any] | None,
+) -> str:
+    """Stop a kernel, or explain that Kaggle's RUNNING status is already stale."""
+    status, failure = kaggle_cli.kernel_status(token, kernel)
+    finished = status == "RUNNING" and kaggle_cli.kernel_run_finished(token, kernel)
+    live = status_blocks_new_launch(status, finished)
+    if live and session is not None:
+        return stop_remote(store, session, token)
+    if live:
+        return (
+            f"{kernel} is {status}. Stop it from https://www.kaggle.com/code/{kernel} "
+            "before starting another. kgate has no tunnel URL for it."
+        )
+    if session is not None:
+        _mark_stopped(store, session, failure or "")
+    if status == "RUNNING" and finished:
+        return (
+            f"{kernel} is not running. Kaggle still reports RUNNING, but the notebook "
+            "log has ended. `kgate up` can start a new session."
+        )
+    detail = f" {failure}" if failure else ""
+    return f"Kaggle status: {status}.{detail} Nothing is running."
+
+
+def require_model(engine: str, model: str) -> None:
+    if engine not in {"none", "unsloth"} and not model:
+        raise ValueError("pass --model, or use --engine none for a shell only, or --engine unsloth for the Studio UI")
+
+
 def launch_session(
     store: Store,
     account: dict[str, Any],
@@ -302,10 +351,9 @@ def launch_session(
     wait: bool,
     slug: str,
 ) -> dict[str, Any]:
-    if engine != "none" and not model:
-        raise ValueError("pass --model, or use --engine none for a shell only")
+    require_model(engine, model)
     if engine != "none" and accelerator.lower().startswith("tpu"):
-        raise ValueError("vLLM, SGLang, and Ollama need a GPU accelerator, not a TPU")
+        raise ValueError("Unsloth, vLLM, SGLang, and Ollama need a GPU accelerator, not a TPU")
     token = store.read_token(account)
     username = kaggle_cli.whoami(token)
     if username != account.get("username"):
@@ -320,11 +368,12 @@ def launch_session(
             print(f"Session {revived['id']} is already up.", flush=True)
             return revived
     status, failure = kaggle_cli.kernel_status(token, kernel)
-    if status not in {"RUNNING", "QUEUED"}:
+    finished = status == "RUNNING" and kaggle_cli.kernel_run_finished(token, kernel)
+    if not status_blocks_new_launch(status, finished):
         for existing in store.active_sessions(account["name"]):
             if existing.get("kernel") == kernel:
                 _mark_stopped(store, existing, failure or f"kernel status {status}")
-    if status in {"RUNNING", "QUEUED"}:
+    else:
         raise RuntimeError(
             f"{kernel} is already {status}. Stop it with `kgate down` or from "
             f"https://www.kaggle.com/code/{kernel} before starting another. {failure}".strip()
@@ -345,6 +394,7 @@ def launch_session(
         print(quota_note, flush=True)
     run_id = secrets.token_hex(8)
     gate_token = secrets.token_urlsafe(32)
+    studio_password = secrets.token_urlsafe(12) if engine == "unsloth" else ""
     cfg = build_config(
         run_id=run_id,
         token=gate_token,
@@ -359,6 +409,7 @@ def launch_session(
         quantization=quantization,
         hf_token=hf_token,
         dtype=dtype,
+        studio_password=studio_password,
     )
     # engine_argv is validated locally so a bad engine fails before the push.
     if engine != "none":
@@ -383,6 +434,8 @@ def launch_session(
         "accelerator": accelerator,
         "engine": engine,
         "model": model,
+        "studio_password": studio_password,
+        "ui_url": "",
         "dtype": cfg["dtype"],
         "hours": planned,
         "tunnel_url": "",
@@ -401,8 +454,12 @@ def launch_session(
         session["status"] = "starting"
         store.upsert_session(session)
         ensure_proxy(store, session)
-        base = f"http://127.0.0.1:{session['local_port']}/v1"
-        print(f"Local API base URL: {base}", flush=True)
+        if session.get("engine") == "unsloth":
+            print("Control tunnel is up. Unsloth Studio is still installing on the notebook.", flush=True)
+            print("The browser link is printed when the UI is ready. `kgate dash` shows it too.", flush=True)
+        else:
+            base = f"http://127.0.0.1:{session['local_port']}/v1"
+            print(f"Local API base URL: {base}", flush=True)
         print("The shell is available with `kgate attach`.", flush=True)
 
     if not wait:
@@ -413,7 +470,7 @@ def launch_session(
             token,
             kernel,
             run_id,
-            timeout_s=45 * 60 if engine != "none" else 20 * 60,
+            timeout_s=80 * 60 if engine == "unsloth" else 45 * 60 if engine != "none" else 20 * 60,
             want_engine=engine != "none",
             on_line=lambda text: print(text, end="", flush=True),
             on_tunnel=on_tunnel,
@@ -424,8 +481,19 @@ def launch_session(
     session["status"] = "ready"
     session["engine_ready"] = True
     session["ready_at"] = _now()
+    if engine == "unsloth":
+        try:
+            payload = parse_marker(kaggle_cli.kernel_logs(token, kernel), "ENGINE", run_id) or {}
+        except kaggle_cli.KaggleError:
+            payload = {}
+        if payload.get("ui_url"):
+            session["ui_url"] = str(payload["ui_url"])
     store.upsert_session(session)
-    if engine != "none":
+    if engine == "unsloth":
+        print(f"Unsloth Studio: {session.get('ui_url') or 'see `kgate logs`'}", flush=True)
+        print(f"Password: {studio_password}", flush=True)
+        print("Open that link and pick a model from the Hugging Face search.", flush=True)
+    elif engine != "none":
         print(
             f"Model is ready. Point any OpenAI client at http://127.0.0.1:{session['local_port']}/v1 "
             f"with model {model!r}. The API key can be any non-empty string.",
@@ -445,6 +513,7 @@ def adopt_logs(store: Store, session: dict[str, Any], logs: str) -> dict[str, An
         session.get("engine_ready"),
         session.get("error"),
         session.get("engine_error"),
+        session.get("ui_url"),
     )
     tunnel = parse_marker(logs, "TUNNEL", run_id)
     engine = parse_marker(logs, "ENGINE", run_id)
@@ -453,6 +522,8 @@ def adopt_logs(store: Store, session: dict[str, Any], logs: str) -> dict[str, An
         session["error"] = str(tunnel["error"])
     if tunnel and tunnel.get("url"):
         session["tunnel_url"] = str(tunnel["url"])
+    if engine and engine.get("ui_url"):
+        session["ui_url"] = str(engine["ui_url"])
     if engine and engine.get("ready"):
         session["status"] = "ready"
         session["engine_ready"] = True
@@ -467,6 +538,7 @@ def adopt_logs(store: Store, session: dict[str, Any], logs: str) -> dict[str, An
         session.get("engine_ready"),
         session.get("error"),
         session.get("engine_error"),
+        session.get("ui_url"),
     )
     proxy_up = _proxy_alive(int(session.get("proxy_pid") or 0))
     if after != before:
@@ -495,7 +567,9 @@ def refresh_session(store: Store, session: dict[str, Any]) -> dict[str, Any]:
 def describe(session: dict[str, Any]) -> dict[str, Any]:
     shown = public_session(session)
     port = session.get("local_port")
-    if port and _proxy_alive(int(session.get("proxy_pid") or 0)):
+    if session.get("engine") == "unsloth":
+        shown["base_url"] = ""
+    elif port and _proxy_alive(int(session.get("proxy_pid") or 0)):
         shown["base_url"] = f"http://127.0.0.1:{port}/v1"
     else:
         shown["base_url"] = ""

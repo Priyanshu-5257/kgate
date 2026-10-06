@@ -93,6 +93,14 @@ Ollama:
 kgate up --engine ollama --model qwen2.5:7b
 ```
 
+Unsloth Studio is the browser UI. It searches Hugging Face and loads GGUF or safetensors from the chat page. The first start installs it on the notebook, which takes a while, and GPU quota runs during that install.
+
+```bash
+kgate up --engine unsloth
+```
+
+`kgate up` prints a link and a password. The dashboard shows the same pair. Sign in, then pick a model in Studio. The link is a Cloudflare tunnel that changes every session. Studio's own `--secure` tunnel is refused on Kaggle, so KGate publishes the loopback page itself. Server-side tools stay off, because that link is on the public internet.
+
 Larger vLLM model:
 
 ```bash
@@ -144,7 +152,7 @@ This is not tmux. While you are detached, nothing reads the PTY, so a noisy proc
 `kgate dash` binds to `127.0.0.1:8787` only.
 
 - Quota bars for every account, with the reset time
-- Sessions, engine, model, status, and the local API URL
+- Sessions, engine, model, status, the local API URL, and the Unsloth Studio link when that engine is running
 - Live notebook log
 - A box that runs one remote command
 - Stop, which asks the notebook to exit and then stops the local proxy
@@ -185,6 +193,6 @@ The tests do not start a Kaggle notebook and do not spend GPU quota.
 
 - Quota is wall-clock time on the accelerator, not tokens generated.
 - A new `kgate up` gets a new tunnel URL. The local port stays `8000` unless that port is taken.
-- If the tunnel dies before `kgate down` can reach it, stop the notebook on its Kaggle page. Otherwise it keeps spending quota until Kaggle's own limit.
+- If the tunnel dies before `kgate down` can reach it, stop the notebook on its Kaggle page. Otherwise it keeps spending quota until Kaggle's own limit. After the notebook has exited, Kaggle can still report the kernel as RUNNING. `kgate down` notices when the log has ended, and `kgate up` is allowed to start the next session.
 - The first vLLM start downloads a large wheel and the model. The shell is usable as soon as the local URL is printed. `kgate logs --follow` shows the install.
 - KGate does not raise the weekly cap and does not keep a session past the hours you set.
